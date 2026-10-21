@@ -1,0 +1,17 @@
+node_modules/
+.artifacts/
+.ref/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+
+# Engagement data must never be committed
+engagements/
+.cyberpi/
+*.pcap
+*.pcapng
+
+# Python bytecode
+__pycache__/
+*.pyc

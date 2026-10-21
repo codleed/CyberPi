@@ -1,0 +1,939 @@
+#!/usr/bin/env bash
+#
+# cyberpi-doctor - diagnose a CyberPi installation and an engagement.
+#
+# The doctor reports on the host, the runtime, the Pi installation, the
+# CyberPi package, the theme, the engagement scope, the CVE database, the
+# engagement journal and every Kali tool that the harness wraps.
+#
+# Usage:
+#   cyberpi-doctor [options]
+#
+# Options:
+#   --engagement <dir>  Engagement to inspect (default: $CYBERPI_ENGAGEMENT or the working directory)
+#   --json              Print the report as JSON
+#   --fix               Apply the safe fixes: engagement directories, permissions, CVE database sync
+#   --yes               Apply the fixes without asking
+#   --help              Show this help
+#
+set -euo pipefail
+
+readonly PROGRAM_NAME="cyberpi-doctor"
+readonly NODE_MIN_VERSION="22.19"
+readonly PYTHON_MIN_VERSION="3.11"
+readonly CVE_STALE_DAYS=7
+readonly TOOL_PROBE_TIMEOUT=25
+
+PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+CYBERPI_HOME_DIR="${CYBERPI_HOME:-$HOME/.cyberpi}"
+CVE_DB_PATH="${CYBERPI_CVE_DB:-$CYBERPI_HOME_DIR/cve.db}"
+SETTINGS_FILE="$PI_AGENT_DIR/settings.json"
+THEME_FILE="$PI_AGENT_DIR/themes/cyber.json"
+PACKAGE_ROOT=""
+
+JSON_OUTPUT=0
+FIX=0
+ASSUME_YES=0
+ENGAGEMENT_DIR=""
+WORK_DIR=""
+
+declare -a CHECK_IDS=()
+declare -a CHECK_SECTIONS=()
+declare -a CHECK_NAMES=()
+declare -a CHECK_STATUSES=()
+declare -a CHECK_DETAILS=()
+declare -a FIX_ACTIONS=()
+
+# --------------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------------
+
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${CYBERPI_NO_COLOR:-}" != "1" ]]; then
+	C_RESET=$'\033[0m'
+	C_BOLD=$'\033[1m'
+	C_DIM=$'\033[2m'
+	C_OK=$'\033[32m'
+	C_WARN=$'\033[33m'
+	C_FAIL=$'\033[31m'
+	C_SKIP=$'\033[90m'
+else
+	C_RESET=""
+	C_BOLD=""
+	C_DIM=""
+	C_OK=""
+	C_WARN=""
+	C_FAIL=""
+	C_SKIP=""
+fi
+
+info() { printf '%s\n' "$*"; }
+step() { printf '%s==>%s %s\n' "$C_BOLD" "$C_RESET" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$C_WARN" "$C_RESET" "$*" >&2; }
+fail() { printf '%serror:%s %s\n' "$C_FAIL" "$C_RESET" "$*" >&2; }
+
+usage() {
+	cat <<'USAGE'
+cyberpi-doctor - diagnose a CyberPi installation and an engagement.
+
+Usage:
+  cyberpi-doctor [options]
+
+Options:
+  --engagement <dir>  Engagement to inspect (default: $CYBERPI_ENGAGEMENT or the working directory)
+  --json              Print the report as JSON
+  --fix               Apply the safe fixes: engagement directories, permissions, CVE database sync
+  --yes               Apply the fixes without asking
+  --help              Show this help
+
+Exit status is 1 when a check failed, 0 otherwise.
+USAGE
+}
+
+# --------------------------------------------------------------------------
+# Small utilities
+# --------------------------------------------------------------------------
+
+add_check() {
+	local id=$1 section=$2 name=$3 status=$4 detail=$5
+	CHECK_IDS+=("$id")
+	CHECK_SECTIONS+=("$section")
+	CHECK_NAMES+=("$name")
+	CHECK_STATUSES+=("$status")
+	CHECK_DETAILS+=("$detail")
+}
+
+add_fix() {
+	FIX_ACTIONS+=("$1")
+}
+
+json_escape() {
+	local text=${1-}
+	text=${text//\\/\\\\}
+	text=${text//\"/\\\"}
+	text=${text//$'\n'/\\n}
+	text=${text//$'\r'/\\r}
+	text=${text//$'\t'/\\t}
+	printf '%s' "$text"
+}
+
+version_ge() {
+	local left=${1#v} right=${2#v}
+	local -a left_parts=() right_parts=()
+	IFS='.' read -r -a left_parts <<<"$left"
+	IFS='.' read -r -a right_parts <<<"$right"
+	local index lv rv
+	for index in 0 1 2; do
+		lv=$(printf '%s' "${left_parts[$index]:-0}" | tr -cd '0-9')
+		rv=$(printf '%s' "${right_parts[$index]:-0}" | tr -cd '0-9')
+		lv=${lv:-0}
+		rv=${rv:-0}
+		lv=$((10#$lv))
+		rv=$((10#$rv))
+		if ((lv > rv)); then return 0; fi
+		if ((lv < rv)); then return 1; fi
+	done
+	return 0
+}
+
+os_release_value() {
+	local key=$1
+	[[ -r /etc/os-release ]] || return 0
+	sed -n "s/^${key}=\"\\(.*\\)\"\$/\\1/p; s/^${key}=\\(.*\\)\$/\\1/p" /etc/os-release | head -n 1
+}
+
+command_path() {
+	command -v "$1" 2>/dev/null || true
+}
+
+# Read the Pi settings file with node when it is available.
+settings_packages() {
+	if ! command -v node >/dev/null 2>&1; then return 0; fi
+	node -e '
+		const fs = require("node:fs");
+		const file = process.argv[1];
+		if (!fs.existsSync(file)) process.exit(0);
+		let data;
+		try { data = JSON.parse(fs.readFileSync(file, "utf8")); } catch { process.exit(0); }
+		const list = Array.isArray(data.packages) ? data.packages : [];
+		for (const entry of list) {
+			if (typeof entry === "string") console.log(entry);
+			else if (entry && typeof entry.source === "string") console.log(entry.source);
+		}
+	' "$SETTINGS_FILE" 2>/dev/null || true
+}
+
+settings_theme() {
+	if ! command -v node >/dev/null 2>&1; then printf ''; return 0; fi
+	node -e '
+		const fs = require("node:fs");
+		const file = process.argv[1];
+		if (!fs.existsSync(file)) { console.log(""); process.exit(0); }
+		let data;
+		try { data = JSON.parse(fs.readFileSync(file, "utf8")); } catch { console.log(""); process.exit(0); }
+		console.log(typeof data.theme === "string" ? data.theme : "");
+	' "$SETTINGS_FILE" 2>/dev/null || true
+}
+
+json_file_value() {
+	# json_file_value <file> <js-expression over `data`>
+	local file=$1 expression=$2
+	if ! command -v node >/dev/null 2>&1; then return 0; fi
+	node -e '
+		const fs = require("node:fs");
+		const file = process.argv[1];
+		const expression = process.argv[2];
+		if (!fs.existsSync(file)) process.exit(0);
+		let data;
+		try { data = JSON.parse(fs.readFileSync(file, "utf8")); } catch { process.exit(0); }
+		let value;
+		try { value = eval(expression); } catch { process.exit(0); }
+		if (value === undefined || value === null) process.exit(0);
+		if (typeof value === "object") value = JSON.stringify(value);
+		console.log(value);
+	' "$file" "$expression" 2>/dev/null || true
+}
+
+# Resolve the CyberPi package directory.
+resolve_package_root() {
+	local candidate source absolute
+	if [[ -n "${CYBERPI_PACKAGE_ROOT:-}" ]]; then
+		printf '%s\n' "$CYBERPI_PACKAGE_ROOT"
+		return 0
+	fi
+	candidate="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
+	if [[ -n "$candidate" && -f "$candidate/package.json" ]] && grep -q 'cyberpi-harness' "$candidate/package.json" 2>/dev/null; then
+		printf '%s\n' "$candidate"
+		return 0
+	fi
+	for candidate in /usr/local/lib/cyberpi /opt/cyberpi "$HOME/.cyberpi/package"; do
+		if [[ -f "$candidate/package.json" ]]; then
+			printf '%s\n' "$candidate"
+			return 0
+		fi
+	done
+	while IFS= read -r source; do
+		[[ -z "$source" ]] && continue
+		case "$source" in
+		/*) absolute=$source ;;
+		~*) absolute="${source/#\~/$HOME}" ;;
+		*) continue ;;
+		esac
+		if [[ -f "$absolute/package.json" ]]; then
+			printf '%s\n' "$absolute"
+			return 0
+		fi
+	done < <(settings_packages)
+	return 1
+}
+
+# --------------------------------------------------------------------------
+# Argument parsing
+# --------------------------------------------------------------------------
+
+parse_args() {
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--engagement)
+			[[ $# -ge 2 ]] || { fail "--engagement needs a directory"; exit 2; }
+			ENGAGEMENT_DIR=$2
+			shift
+			;;
+		--engagement=*)
+			ENGAGEMENT_DIR=${1#*=}
+			;;
+		--json)
+			JSON_OUTPUT=1
+			;;
+		--fix)
+			FIX=1
+			;;
+		--yes | -y)
+			ASSUME_YES=1
+			;;
+		--help | -h)
+			usage
+			exit 0
+			;;
+		*)
+			fail "unknown option: $1"
+			usage >&2
+			exit 2
+			;;
+		esac
+		shift
+	done
+}
+
+resolve_paths() {
+	WORK_DIR=$(pwd)
+	if [[ -z "$ENGAGEMENT_DIR" ]]; then
+		ENGAGEMENT_DIR="${CYBERPI_ENGAGEMENT:-$WORK_DIR}"
+	fi
+	if [[ ! "$ENGAGEMENT_DIR" = /* ]]; then
+		ENGAGEMENT_DIR="$WORK_DIR/$ENGAGEMENT_DIR"
+	fi
+	ENGAGEMENT_DIR="${ENGAGEMENT_DIR%/}"
+	[[ -n "$ENGAGEMENT_DIR" ]] || ENGAGEMENT_DIR=$WORK_DIR
+	PACKAGE_ROOT="$(resolve_package_root || true)"
+}
+
+# --------------------------------------------------------------------------
+# Checks
+# --------------------------------------------------------------------------
+
+check_os() {
+	local system kernel
+	system=$(uname -s 2>/dev/null || echo unknown)
+	kernel=$(uname -sr 2>/dev/null || echo unknown)
+	if [[ "$system" != "Linux" ]]; then
+		add_check os system "Operating system" fail "CyberPi targets Kali Linux; this host reports $system."
+		add_check os-kernel system "Kernel" warn "$kernel"
+		return
+	fi
+	local name id like version is_kali=0
+	name=$(os_release_value NAME)
+	id=$(os_release_value ID)
+	like=$(os_release_value ID_LIKE)
+	version=$(os_release_value VERSION_ID)
+	[[ "$id" == "kali" ]] && is_kali=1
+	[[ "$like" == *kali* ]] && is_kali=1
+	if [[ $is_kali -eq 1 ]]; then
+		add_check os system "Operating system" ok "Kali GNU/Linux ${version:-rolling} (${id:-kali}) - ${name:-Kali}"
+	elif [[ "${CYBERPI_STRICT_KALI:-}" == "1" ]]; then
+		add_check os system "Operating system" fail "${name:-Linux} detected and CYBERPI_STRICT_KALI=1 is set; CyberPi refuses non-Kali hosts."
+	else
+		add_check os system "Operating system" warn "${name:-Linux} detected, not Kali. Most tools work; set CYBERPI_STRICT_KALI=1 to refuse non-Kali hosts."
+	fi
+	add_check os-kernel system "Kernel" ok "$kernel"
+}
+
+check_runtime() {
+	local node_path node_version
+	node_path=$(command_path node)
+	if [[ -z "$node_path" ]]; then
+		add_check runtime-node runtime "Node.js >= ${NODE_MIN_VERSION}" fail "node was not found on PATH."
+	else
+		node_version=$(node -v 2>/dev/null || echo "unknown")
+		if version_ge "$node_version" "$NODE_MIN_VERSION"; then
+			add_check runtime-node runtime "Node.js >= ${NODE_MIN_VERSION}" ok "$node_version ($node_path)"
+		else
+			add_check runtime-node runtime "Node.js >= ${NODE_MIN_VERSION}" fail "$node_version is too old ($node_path); Pi requires ${NODE_MIN_VERSION} or newer."
+		fi
+	fi
+
+	local python_path python_version
+	python_path=$(command_path python3)
+	if [[ -z "$python_path" ]]; then
+		add_check runtime-python runtime "Python 3 >= ${PYTHON_MIN_VERSION}" fail "python3 was not found on PATH; the CVE database needs it."
+	else
+		python_version=$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo "unknown")
+		if version_ge "$python_version" "$PYTHON_MIN_VERSION"; then
+			add_check runtime-python runtime "Python 3 >= ${PYTHON_MIN_VERSION}" ok "$python_version ($python_path)"
+		else
+			add_check runtime-python runtime "Python 3 >= ${PYTHON_MIN_VERSION}" warn "$python_version is older than ${PYTHON_MIN_VERSION}; the CVE database may not run."
+		fi
+	fi
+}
+
+check_pi() {
+	local pi_path pi_version
+	pi_path=$(command_path pi)
+	if [[ -z "$pi_path" ]]; then
+		add_check pi runtime "Pi coding agent" fail "pi was not found on PATH. Install it with: curl -fsSL https://pi.dev/install.sh | sh"
+		return
+	fi
+	pi_version=$(pi --version 2>/dev/null | head -n 1 | tr -d '\r' || true)
+	[[ -z "$pi_version" ]] && pi_version="installed"
+	add_check pi runtime "Pi coding agent" ok "${pi_version} ($pi_path)"
+	if [[ -d "$PI_AGENT_DIR" ]]; then
+		add_check pi-agent-dir runtime "Pi agent directory" ok "$PI_AGENT_DIR"
+	else
+		add_check pi-agent-dir runtime "Pi agent directory" warn "$PI_AGENT_DIR does not exist yet."
+	fi
+}
+
+check_package() {
+	if [[ -z "$PACKAGE_ROOT" ]]; then
+		add_check package runtime "CyberPi package" fail "The CyberPi package directory was not found. Re-run install.sh, or set CYBERPI_PACKAGE_ROOT."
+	else
+		local extensions=0
+		if [[ -d "$PACKAGE_ROOT/extensions" ]]; then
+			extensions=$(find "$PACKAGE_ROOT/extensions" -name '*.ts' -type f 2>/dev/null | wc -l | tr -d ' ')
+		fi
+		if [[ "$extensions" -gt 0 ]]; then
+			add_check package runtime "CyberPi package" ok "$PACKAGE_ROOT ($extensions TypeScript sources)"
+		else
+			add_check package runtime "CyberPi package" warn "$PACKAGE_ROOT has no extensions/ directory."
+		fi
+	fi
+
+	local registered=0 sources=()
+	mapfile -t sources < <(settings_packages)
+	local source resolved
+	for source in "${sources[@]}"; do
+		[[ -z "$source" ]] && continue
+		resolved=$source
+		case "$resolved" in
+		~*) resolved="${resolved/#\~/$HOME}" ;;
+		esac
+		if [[ "$source" == *"cyberpi"* || "$resolved" == "${PACKAGE_ROOT:-/nonexistent}" ]]; then
+			registered=1
+			add_check package-registered runtime "Package declaration" ok "$source (in $SETTINGS_FILE)"
+			break
+		fi
+	done
+	if [[ $registered -eq 0 ]]; then
+		add_check package-registered runtime "Package declaration" warn "The CyberPi package is not declared in $SETTINGS_FILE; run 'pi install <package>' or use the launcher."
+	fi
+}
+
+check_theme() {
+	if [[ -f "$THEME_FILE" ]]; then
+		local theme_name
+		theme_name=$(json_file_value "$THEME_FILE" 'data.name' || true)
+		[[ -z "$theme_name" ]] && theme_name="cyber"
+		add_check theme runtime "Cyber theme" ok "$THEME_FILE ($theme_name)"
+	else
+		add_check theme runtime "Cyber theme" warn "$THEME_FILE is missing; the theme ships with the CyberPi package."
+	fi
+	local selected
+	selected=$(settings_theme)
+	if [[ -z "$selected" ]]; then
+		add_check theme-selected runtime "Theme selection" warn "No theme is selected in $SETTINGS_FILE; the launcher selects the cyber theme."
+	elif [[ "$selected" == "cyber" ]]; then
+		add_check theme-selected runtime "Theme selection" ok "cyber"
+	else
+		add_check theme-selected runtime "Theme selection" ok "$selected"
+	fi
+}
+
+check_engagement() {
+	if [[ -d "$ENGAGEMENT_DIR" ]]; then
+		add_check engagement-dir engagement "Engagement directory" ok "$ENGAGEMENT_DIR"
+	else
+		add_check engagement-dir engagement "Engagement directory" fail "$ENGAGEMENT_DIR does not exist."
+		return
+	fi
+	local subdir
+	local missing=()
+	for subdir in .cyberpi .cyberpi/artifacts .cyberpi/findings .cyberpi/notes .cyberpi/reports .cyberpi/cache; do
+		[[ -d "$ENGAGEMENT_DIR/$subdir" ]] || missing+=("$subdir")
+	done
+	if [[ ${#missing[@]} -eq 0 ]]; then
+		add_check engagement-layout engagement "Engagement layout" ok "artifacts, findings, notes, reports and cache are present"
+	else
+		add_check engagement-layout engagement "Engagement layout" warn "missing: ${missing[*]} (run with --fix to create them)"
+	fi
+}
+
+check_scope() {
+	local scope_file="$ENGAGEMENT_DIR/.cyberpi/scope.json"
+	if [[ ! -f "$scope_file" ]]; then
+		add_check scope engagement "Scope file" fail "$scope_file is missing; create it before running any action."
+		return
+	fi
+	add_check scope engagement "Scope file" ok "$scope_file"
+	if ! command -v node >/dev/null 2>&1; then
+		add_check scope-parse engagement "Scope parse" warn "node is not available, the scope file was not parsed."
+		return
+	fi
+	local result
+	result=$(node -e '
+		const fs = require("node:fs");
+		const file = process.argv[1];
+		function stripComments(input) {
+			let out = "";
+			let inString = false;
+			let inLine = false;
+			let inBlock = false;
+			for (let i = 0; i < input.length; i++) {
+				const ch = input[i];
+				const next = input[i + 1];
+				if (inLine) { if (ch === "\n") { inLine = false; out += ch; } continue; }
+				if (inBlock) { if (ch === "*" && next === "/") { inBlock = false; i++; } continue; }
+				if (inString) {
+					if (ch === "\\") { out += ch + (next ?? ""); i++; continue; }
+					if (ch === "\"") inString = false;
+					out += ch;
+					continue;
+				}
+				if (ch === "\"") { inString = true; out += ch; continue; }
+				if (ch === "/" && next === "/") { inLine = true; i++; continue; }
+				if (ch === "/" && next === "*") { inBlock = true; i++; continue; }
+				out += ch;
+			}
+			return out;
+		}
+		let data;
+		try {
+			data = JSON.parse(stripComments(fs.readFileSync(file, "utf8")));
+		} catch (error) {
+			console.log("INVALID\t" + error.message);
+			process.exit(0);
+		}
+		if (typeof data !== "object" || data === null || Array.isArray(data)) {
+			console.log("INVALID\tscope.json must contain a JSON object");
+			process.exit(0);
+		}
+		if (typeof data.engagement !== "string" || data.engagement.length === 0) {
+			console.log("INVALID\tscope.json must define a non-empty \"engagement\" name");
+			process.exit(0);
+		}
+		if (!Array.isArray(data.rules)) {
+			console.log("INVALID\tscope.json must define a \"rules\" array");
+			process.exit(0);
+		}
+		let bad = -1;
+		for (let i = 0; i < data.rules.length; i++) {
+			if (!data.rules[i] || typeof data.rules[i].target !== "string" || data.rules[i].target.length === 0) {
+				bad = i;
+				break;
+			}
+		}
+		if (bad >= 0) {
+			console.log("INVALID\tscope.json rule #" + (bad + 1) + " is missing a \"target\"");
+			process.exit(0);
+		}
+		const targets = data.rules.map((rule) => rule.target);
+		const techniques = Array.isArray(data.techniques) && data.techniques.length > 0 ? data.techniques.join(", ") : "all";
+		console.log("OK\t" + data.engagement + "\t" + targets.length + "\t" + techniques + "\t" + (data.client ?? ""));
+	' "$scope_file" 2>/dev/null || true)
+	local verdict=${result%%$'\t'*}
+	if [[ "$verdict" != "OK" ]]; then
+		local message=${result#*$'\t'}
+		add_check scope-parse engagement "Scope parse" fail "${message:-the scope file could not be parsed}"
+		return
+	fi
+	local rest=${result#*$'\t'}
+	local name=${rest%%$'\t'*}
+	rest=${rest#*$'\t'}
+	local count=${rest%%$'\t'*}
+	rest=${rest#*$'\t'}
+	local techniques=${rest%%$'\t'*}
+	rest=${rest#*$'\t'}
+	local client=${rest%%$'\t'*}
+	local client_text=""
+	[[ -n "$client" ]] && client_text=", client $client"
+	add_check scope-parse engagement "Scope parse" ok "engagement \"$name\"$client_text, $count rule(s), techniques: $techniques"
+	if [[ "$count" == "0" ]]; then
+		add_check scope-rules engagement "Authorized targets" warn "The scope has no rules, so only self-tests against the local machine are allowed."
+	else
+		add_check scope-rules engagement "Authorized targets" ok "$count rule(s) authorized"
+	fi
+}
+
+check_cve_database() {
+	local script=""
+	if [[ -n "$PACKAGE_ROOT" ]]; then
+		script="$PACKAGE_ROOT/tools/cvedb/cvedb.py"
+	fi
+	if [[ -z "$script" || ! -f "$script" ]]; then
+		add_check cvedb-script cve "CVE database tool" warn "cvedb.py was not found in the package; the CVE tools will not work."
+	else
+		add_check cvedb-script cve "CVE database tool" ok "$script"
+	fi
+	if [[ ! -f "$CVE_DB_PATH" ]]; then
+		add_check cvedb cve "CVE database" warn "$CVE_DB_PATH does not exist; run 'cyberpi-doctor --fix' to seed it."
+		return
+	fi
+	local size age
+	size=$(wc -c <"$CVE_DB_PATH" | tr -d ' ')
+	local modified
+	modified=$(date -r "$CVE_DB_PATH" +%s 2>/dev/null || echo "")
+	local now
+	now=$(date +%s)
+	if [[ -n "$modified" ]]; then
+		age=$(( (now - modified) / 86400 ))
+	else
+		age=-1
+	fi
+	if [[ $age -ge 0 && $age -le $CVE_STALE_DAYS ]]; then
+		add_check cvedb cve "CVE database" ok "$CVE_DB_PATH ($size bytes, updated ${age}d ago)"
+	else
+		add_check cvedb cve "CVE database" warn "$CVE_DB_PATH ($size bytes, updated ${age}d ago); it is stale after ${CVE_STALE_DAYS} days."
+	fi
+	if command -v python3 >/dev/null 2>&1; then
+		local tables
+		tables=$(python3 - "$CVE_DB_PATH" <<'PY' 2>/dev/null || true
+import sqlite3
+import sys
+
+try:
+    connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+    names = [row[0] for row in connection.execute("select name from sqlite_master where type='table' order by name")]
+    parts = []
+    for name in names:
+        try:
+            count = connection.execute(f'select count(*) from "{name}"').fetchone()[0]
+        except sqlite3.Error:
+            continue
+        parts.append(f"{name}={count}")
+    print(", ".join(parts))
+finally:
+    pass
+PY
+		)
+		if [[ -n "$tables" ]]; then
+			add_check cvedb-tables cve "CVE database contents" ok "$tables"
+		fi
+	fi
+}
+
+check_activity() {
+	local journal="$ENGAGEMENT_DIR/.cyberpi/journal.jsonl"
+	local findings_dir="$ENGAGEMENT_DIR/.cyberpi/findings"
+	if [[ -f "$journal" ]]; then
+		local total
+		total=$(grep -c '[^[:space:]]' "$journal" 2>/dev/null || true)
+		total=${total:-0}
+		local last
+		last=$(tail -n 1 "$journal" 2>/dev/null | node -e '
+			let raw = "";
+			process.stdin.on("data", (chunk) => { raw += chunk; });
+			process.stdin.on("end", () => {
+				try {
+					const entry = JSON.parse(raw.trim());
+					console.log(entry.ts ?? "");
+				} catch { console.log(""); }
+			});
+		' 2>/dev/null || true)
+		if [[ -n "$last" ]]; then
+			add_check journal engagement "Engagement journal" ok "$total entries, last action $last"
+		else
+			add_check journal engagement "Engagement journal" ok "$total entries"
+		fi
+	else
+		add_check journal engagement "Engagement journal" warn "no journal at $journal yet"
+	fi
+
+	if [[ -d "$findings_dir" ]]; then
+		local count severities
+		count=$(find "$findings_dir" -maxdepth 1 -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+		severities=$(grep -h '^severity:' "$findings_dir"/*.md 2>/dev/null | sed 's/^severity:[[:space:]]*//' | sort | uniq -c | tr '\n' ' ' || true)
+		severities=${severities%" "}
+		if [[ -n "$severities" ]]; then
+			add_check findings engagement "Findings" ok "$count finding(s) [$severities]"
+		else
+			add_check findings engagement "Findings" ok "$count finding(s)"
+		fi
+	else
+		add_check findings engagement "Findings" warn "no findings directory at $findings_dir"
+	fi
+
+	local surface="$ENGAGEMENT_DIR/.cyberpi/surface.json"
+	if [[ -f "$surface" ]]; then
+		local hosts services endpoints
+		hosts=$(json_file_value "$surface" 'Array.isArray(data.hosts) ? data.hosts.length : 0' || true)
+		services=$(json_file_value "$surface" 'Array.isArray(data.services) ? data.services.length : 0' || true)
+		endpoints=$(json_file_value "$surface" 'Array.isArray(data.endpoints) ? data.endpoints.length : 0' || true)
+		add_check surface engagement "Attack surface" ok "${hosts:-0} host(s), ${services:-0} service(s), ${endpoints:-0} endpoint(s)"
+	else
+		add_check surface engagement "Attack surface" warn "no surface index at $surface yet"
+	fi
+}
+
+# Every Kali tool the harness wraps, with the command that reports its version
+# and the apt package that provides it.
+tool_table() {
+	cat <<'TOOLS'
+subfinder|subfinder|subfinder -version|recon|subfinder|Subdomain enumeration
+dig|dig|dig -v|recon|dnsutils|DNS resolution
+whois|whois|whois --version|recon|whois|Registration lookups
+naabu|naabu|naabu -version|network|naabu|Fast SYN port scan
+nmap|nmap|nmap --version|network|nmap|Service enumeration
+tcpdump|tcpdump|tcpdump --version|network|tcpdump|Packet capture
+httpx|httpx|httpx -version|web|httpx-toolkit|HTTP probing
+katana|katana|katana -version|web|katana|Crawling
+ffuf|ffuf|ffuf -V|web|ffuf|Directory enumeration
+nuclei|nuclei|nuclei -version|web|nuclei|Template scanning
+sqlmap|sqlmap|sqlmap --version|web|sqlmap|SQL injection testing
+dalfox|dalfox|dalfox version|web|dalfox|Cross-site scripting testing
+searchsploit|searchsploit|searchsploit --version|exploit|exploitdb|Exploit database
+msfconsole|msfconsole|msfconsole --version|exploit|metasploit-framework|Metasploit framework
+curl|curl|curl --version|exploit|curl|Proof of concept requests
+hashcat|hashcat|hashcat --version|credentials|hashcat|Hash identification and cracking
+hydra|hydra|hydra -h|credentials|hydra|Online password audit
+trufflehog|trufflehog|trufflehog --version|credentials|trufflehog|Secret scanning
+ldapdomaindump|ldapdomaindump|ldapdomaindump -h|active-directory|ldapdomaindump|LDAP enumeration
+impacket-smbserver|impacket-smbserver|impacket-smbserver -h|active-directory|impacket-scripts|AD relay helpers
+airodump-ng|airodump-ng||wireless|aircrack-ng|Wireless capture
+aircrack-ng|aircrack-ng|aircrack-ng --version|wireless|aircrack-ng|Wireless key cracking
+binwalk|binwalk|binwalk -V|iot|binwalk|Firmware analysis
+hidrd|hidrd|hidrd --version|iot|hidrd|HID descriptor analysis
+chisel|chisel|chisel --version|network|chisel|TCP tunnels
+aws|aws|aws --version|cloud|awscli|Cloud enumeration
+python3|python3|python3 --version|runtime|python3|CVE database
+TOOLS
+}
+
+check_tools() {
+	local outdir
+	outdir=$(mktemp -d)
+	local id binary version_args group apt label
+	while IFS='|' read -r id binary version_args group apt label; do
+		[[ -z "$id" ]] && continue
+		if ! command -v "$binary" >/dev/null 2>&1; then
+			printf 'missing\n' >"$outdir/$id.info"
+			continue
+		fi
+		(
+			local output=""
+			if [[ -n "$version_args" ]]; then
+				if command -v timeout >/dev/null 2>&1; then
+					output=$(timeout "$TOOL_PROBE_TIMEOUT" $version_args 2>&1 || true)
+				else
+					output=$($version_args 2>&1 || true)
+				fi
+			fi
+			output=$(printf '%s' "$output" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e '/^$/d' | head -n 2 | tr '\n' ' ' | cut -c1-160)
+			printf 'present\t%s' "$output" >"$outdir/$id.info"
+		) &
+	done < <(tool_table)
+	wait || true
+
+	while IFS='|' read -r id binary version_args group apt label; do
+		[[ -z "$id" ]] && continue
+		local info state version
+		info=$(cat "$outdir/$id.info" 2>/dev/null || printf 'missing\n')
+		state=${info%%$'\t'*}
+		version=${info#*$'\t'}
+		if [[ "$state" == "present" ]]; then
+			if [[ "$version" =~ [Uu]sage:|[Ee]rror:|No\ such\ option|traceback|command\ not\ found ]]; then
+				add_check "tool-$id" tools "$label" warn \
+					"$binary is present but did not answer the version probe - it is probably a different tool with the same name. Install the Kali package: apt install $apt"
+			elif [[ -n "$version" ]]; then
+				add_check "tool-$id" tools "$label" ok "$binary - ${version}"
+			else
+				add_check "tool-$id" tools "$label" ok "$binary (installed, version not reported)"
+			fi
+		elif [[ "$id" == "python3" ]]; then
+			add_check "tool-$id" tools "$label" fail "$binary was not found on PATH (apt install $apt)"
+		else
+			add_check "tool-$id" tools "$label" warn "$binary was not found on PATH (apt install $apt)"
+		fi
+	done < <(tool_table)
+	rm -rf "$outdir"
+}
+
+# --------------------------------------------------------------------------
+# Fixes
+# --------------------------------------------------------------------------
+
+confirm() {
+	local question=$1
+	if [[ $ASSUME_YES -eq 1 || $JSON_OUTPUT -eq 1 ]]; then
+		return 0
+	fi
+	if [[ ! -t 0 ]]; then
+		return 1
+	fi
+	local answer
+	printf '%s [y/N] ' "$question"
+	read -r answer || answer=""
+	case "$answer" in
+	y | Y | yes | YES) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# The CVE sync downloads a lot of data, so it always needs an explicit
+# confirmation, even in JSON mode.
+confirm_sync() {
+	local question=$1
+	if [[ $ASSUME_YES -eq 1 ]]; then
+		return 0
+	fi
+	if [[ ! -t 0 ]]; then
+		return 1
+	fi
+	local answer
+	printf '%s [y/N] ' "$question"
+	read -r answer || answer=""
+	case "$answer" in
+	y | Y | yes | YES) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+apply_fixes() {
+	local subdir
+	for subdir in .cyberpi .cyberpi/artifacts .cyberpi/findings .cyberpi/notes .cyberpi/reports .cyberpi/cache; do
+		if [[ ! -d "$ENGAGEMENT_DIR/$subdir" ]]; then
+			if mkdir -p "$ENGAGEMENT_DIR/$subdir" 2>/dev/null; then
+				add_fix "created $ENGAGEMENT_DIR/$subdir"
+			else
+				warn "could not create $ENGAGEMENT_DIR/$subdir"
+			fi
+		fi
+	done
+
+	if [[ -d "$CYBERPI_HOME_DIR" ]]; then
+		local mode
+		mode=$(stat -c '%a' "$CYBERPI_HOME_DIR" 2>/dev/null || echo "")
+		if [[ -n "$mode" && "$mode" != "700" ]]; then
+			if chmod 700 "$CYBERPI_HOME_DIR" 2>/dev/null; then
+				add_fix "set permissions 700 on $CYBERPI_HOME_DIR (was $mode)"
+			fi
+		fi
+	else
+		if mkdir -p "$CYBERPI_HOME_DIR" 2>/dev/null && chmod 700 "$CYBERPI_HOME_DIR" 2>/dev/null; then
+			add_fix "created $CYBERPI_HOME_DIR with permissions 700"
+		fi
+	fi
+
+	local script=""
+	[[ -n "$PACKAGE_ROOT" ]] && script="$PACKAGE_ROOT/tools/cvedb/cvedb.py"
+	local needs_sync=0
+	if [[ ! -f "$CVE_DB_PATH" ]]; then
+		needs_sync=1
+	else
+		local modified now age
+		modified=$(date -r "$CVE_DB_PATH" +%s 2>/dev/null || echo "")
+		now=$(date +%s)
+		if [[ -n "$modified" ]]; then
+			age=$(( (now - modified) / 86400 ))
+			[[ $age -gt $CVE_STALE_DAYS ]] && needs_sync=1
+		fi
+	fi
+	if [[ $needs_sync -eq 1 ]]; then
+		if [[ -z "$script" || ! -f "$script" ]]; then
+			warn "cvedb.py is not available, the CVE database was not synced."
+		elif ! command -v python3 >/dev/null 2>&1; then
+			warn "python3 is not available, the CVE database was not synced."
+		elif confirm_sync "Sync the CVE database now (downloads the NVD, KEV and EPSS feeds)?"; then
+			step "syncing the CVE database into $CVE_DB_PATH"
+			if python3 "$script" sync; then
+				add_fix "synced the CVE database into $CVE_DB_PATH"
+			else
+				warn "the CVE database sync failed"
+			fi
+		else
+			add_fix "skipped the CVE database sync, run it with --yes or 'python3 $script sync'"
+		fi
+	fi
+}
+
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+
+status_color() {
+	case "$1" in
+	ok) printf '%s' "$C_OK" ;;
+	warn) printf '%s' "$C_WARN" ;;
+	fail) printf '%s' "$C_FAIL" ;;
+	*) printf '%s' "$C_SKIP" ;;
+	esac
+}
+
+status_label() {
+	case "$1" in
+	ok) printf 'ok  ' ;;
+	warn) printf 'warn' ;;
+	fail) printf 'fail' ;;
+	*) printf 'skip' ;;
+	esac
+}
+
+count_status() {
+	local wanted=$1 index=0 total=0
+	for index in "${!CHECK_STATUSES[@]}"; do
+		[[ "${CHECK_STATUSES[$index]}" == "$wanted" ]] && total=$((total + 1))
+	done
+	printf '%s' "$total"
+}
+
+print_text_report() {
+	local index section
+	printf '%sCyberPi doctor%s  %s\n\n' "$C_BOLD" "$C_RESET" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	local -a sections=()
+	for index in "${!CHECK_SECTIONS[@]}"; do
+		section=${CHECK_SECTIONS[$index]}
+		local seen=0 known
+		for known in "${sections[@]}"; do
+			[[ "$known" == "$section" ]] && seen=1 && break
+		done
+		[[ $seen -eq 0 ]] && sections+=("$section")
+	done
+	for section in "${sections[@]}"; do
+		printf '\n%s%s%s\n' "$C_BOLD" "$section" "$C_RESET"
+		for index in "${!CHECK_IDS[@]}"; do
+			[[ "${CHECK_SECTIONS[$index]}" == "$section" ]] || continue
+			local color label
+			color=$(status_color "${CHECK_STATUSES[$index]}")
+			label=$(status_label "${CHECK_STATUSES[$index]}")
+			printf '  %s%s%s  %-34s %s\n' "$color" "$label" "$C_RESET" "${CHECK_NAMES[$index]}" "${CHECK_DETAILS[$index]}"
+		done
+	done
+	if [[ ${#FIX_ACTIONS[@]} -gt 0 ]]; then
+		printf '\n%sFixes applied%s\n' "$C_BOLD" "$C_RESET"
+		for index in "${!FIX_ACTIONS[@]}"; do
+			printf '  %s-> %s\n' "$C_DIM" "$C_RESET" "${FIX_ACTIONS[$index]}"
+		done
+	fi
+	printf '\n%sSummary%s  ok %s   warn %s   fail %s\n' "$C_BOLD" "$C_RESET" \
+		"$(count_status ok)" "$(count_status warn)" "$(count_status fail)"
+	if [[ $(count_status fail) -gt 0 ]]; then
+		printf '%sThe installation has problems that stop CyberPi from running.%s\n' "$C_FAIL" "$C_RESET"
+	else
+		printf '%sCyberPi is ready.%s\n' "$C_OK" "$C_RESET"
+	fi
+}
+
+print_json_report() {
+	local index
+	printf '{\n'
+	printf '  "generatedAt": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	printf '  "ok": %s,\n' "$([[ $(count_status fail) -gt 0 ]] && echo false || echo true)"
+	printf '  "engagement": "%s",\n' "$(json_escape "$ENGAGEMENT_DIR")"
+	printf '  "packageRoot": "%s",\n' "$(json_escape "$PACKAGE_ROOT")"
+	printf '  "summary": { "ok": %s, "warn": %s, "fail": %s, "skip": %s },\n' \
+		"$(count_status ok)" "$(count_status warn)" "$(count_status fail)" "$(count_status skip)"
+	printf '  "fixes": ['
+	for index in "${!FIX_ACTIONS[@]}"; do
+		[[ $index -gt 0 ]] && printf ', '
+		printf '"%s"' "$(json_escape "${FIX_ACTIONS[$index]}")"
+	done
+	printf '],\n'
+	printf '  "checks": [\n'
+	for index in "${!CHECK_IDS[@]}"; do
+		printf '    { "id": "%s", "section": "%s", "name": "%s", "status": "%s", "detail": "%s" }' \
+			"$(json_escape "${CHECK_IDS[$index]}")" \
+			"$(json_escape "${CHECK_SECTIONS[$index]}")" \
+			"$(json_escape "${CHECK_NAMES[$index]}")" \
+			"$(json_escape "${CHECK_STATUSES[$index]}")" \
+			"$(json_escape "${CHECK_DETAILS[$index]}")"
+		if [[ $index -lt $(( ${#CHECK_IDS[@]} - 1 )) ]]; then printf ',\n'; else printf '\n'; fi
+	done
+	printf '  ]\n'
+	printf '}\n'
+}
+
+main() {
+	parse_args "$@"
+	resolve_paths
+	if [[ $FIX -eq 1 ]]; then
+		apply_fixes
+	fi
+	check_os
+	check_runtime
+	check_pi
+	check_package
+	check_theme
+	check_engagement
+	check_scope
+	check_cve_database
+	check_activity
+	check_tools
+	if [[ $JSON_OUTPUT -eq 1 ]]; then
+		print_json_report
+	else
+		print_text_report
+	fi
+	if [[ $(count_status fail) -gt 0 ]]; then
+		exit 1
+	fi
+	exit 0
+}
+
+main "$@"

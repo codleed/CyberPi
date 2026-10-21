@@ -1,0 +1,879 @@
+#!/usr/bin/env bash
+#
+# cyberpi-report - render the report of an engagement without the agent.
+#
+# The report is built from the engagement state: the authorization scope, the
+# attack surface index, the recorded findings and the action journal.
+#
+# Usage:
+#   cyberpi-report [options]
+#
+# Options:
+#   --engagement <dir>   Engagement to report on (default: $CYBERPI_ENGAGEMENT or the working directory)
+#   --format <format>    markdown (default) or html
+#   --output <file>      Write the report to a file instead of stdout
+#   --help               Show this help
+#
+set -euo pipefail
+
+readonly PROGRAM_NAME="cyberpi-report"
+readonly ENGAGEMENT_DIRNAME=".cyberpi"
+
+FORMAT="markdown"
+OUTPUT_FILE=""
+ENGAGEMENT_DIR=""
+PACKAGE_ROOT=""
+
+usage() {
+	cat <<'USAGE'
+cyberpi-report - render the report of a CyberPi engagement.
+
+Usage:
+  cyberpi-report [options]
+
+Options:
+  --engagement <dir>   Engagement to report on (default: $CYBERPI_ENGAGEMENT or the working directory)
+  --format <format>    markdown (default) or html
+  --output <file>      Write the report to a file instead of stdout
+  --help               Show this help
+
+The report contains the authorization scope, the attack surface index, the
+recorded findings and a summary of the action journal.
+USAGE
+}
+
+fail() { printf 'error: %s\n' "$*" >&2; }
+
+resolve_package_root() {
+	local candidate
+	if [[ -n "${CYBERPI_PACKAGE_ROOT:-}" ]]; then
+		printf '%s\n' "$CYBERPI_PACKAGE_ROOT"
+		return 0
+	fi
+	candidate="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
+	if [[ -n "$candidate" && -f "$candidate/package.json" ]] && grep -q 'cyberpi-harness' "$candidate/package.json" 2>/dev/null; then
+		printf '%s\n' "$candidate"
+		return 0
+	fi
+	for candidate in /usr/local/lib/cyberpi /opt/cyberpi "$HOME/.cyberpi/package"; do
+		if [[ -f "$candidate/package.json" ]]; then
+			printf '%s\n' "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--engagement)
+		[[ $# -ge 2 ]] || { fail "--engagement needs a directory"; exit 2; }
+		ENGAGEMENT_DIR=$2
+		shift
+		;;
+	--engagement=*)
+		ENGAGEMENT_DIR=${1#*=}
+		;;
+	--format | -f)
+		[[ $# -ge 2 ]] || { fail "--format needs a value"; exit 2; }
+		FORMAT=$2
+		shift
+		;;
+	--format=*)
+		FORMAT=${1#*=}
+		;;
+	--output | -o)
+		[[ $# -ge 2 ]] || { fail "--output needs a file"; exit 2; }
+		OUTPUT_FILE=$2
+		shift
+		;;
+	--output=*)
+		OUTPUT_FILE=${1#*=}
+		;;
+	--help | -h)
+		usage
+		exit 0
+		;;
+	*)
+		fail "unknown option: $1"
+		usage >&2
+		exit 2
+		;;
+	esac
+	shift
+done
+
+case "$FORMAT" in
+markdown | md) FORMAT="markdown" ;;
+html | htm) FORMAT="html" ;;
+*)
+	fail "unsupported format: $FORMAT (use markdown or html)"
+	exit 2
+	;;
+esac
+
+if [[ -z "$ENGAGEMENT_DIR" ]]; then
+	ENGAGEMENT_DIR="${CYBERPI_ENGAGEMENT:-$PWD}"
+fi
+if [[ ! "$ENGAGEMENT_DIR" = /* ]]; then
+	ENGAGEMENT_DIR="$PWD/$ENGAGEMENT_DIR"
+fi
+ENGAGEMENT_DIR="${ENGAGEMENT_DIR%/}"
+[[ -n "$ENGAGEMENT_DIR" ]] || ENGAGEMENT_DIR=$PWD
+
+if [[ ! -d "$ENGAGEMENT_DIR" ]]; then
+	fail "the engagement directory $ENGAGEMENT_DIR does not exist."
+	exit 1
+fi
+
+PACKAGE_ROOT="$(resolve_package_root || true)"
+
+# A reporting helper shipped with the package takes precedence over the
+# built-in renderer, so the agent and the command always produce the same
+# document.
+HELPER=""
+if [[ -n "${CYBERPI_REPORT_HELPER:-}" ]]; then
+	HELPER=$CYBERPI_REPORT_HELPER
+elif [[ -n "$PACKAGE_ROOT" && -f "$PACKAGE_ROOT/tools/report/report.py" ]]; then
+	HELPER="$PACKAGE_ROOT/tools/report/report.py"
+fi
+
+if [[ -n "$HELPER" ]]; then
+	if ! command -v python3 >/dev/null 2>&1; then
+		fail "python3 is required to render the report."
+		exit 1
+	fi
+	if [[ ! -f "$HELPER" ]]; then
+		fail "the reporting helper $HELPER was not found."
+		exit 1
+	fi
+	if [[ -n "$OUTPUT_FILE" ]]; then
+		python3 "$HELPER" "$ENGAGEMENT_DIR" "$FORMAT" "$OUTPUT_FILE"
+	else
+		python3 "$HELPER" "$ENGAGEMENT_DIR" "$FORMAT"
+	fi
+	exit $?
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+	fail "python3 is required to render the report."
+	exit 1
+fi
+
+python3 - "$ENGAGEMENT_DIR" "$FORMAT" "$OUTPUT_FILE" <<'PYTHON'
+import datetime
+import glob
+import html
+import json
+import os
+import re
+import sys
+
+ENGAGEMENT_DIR = sys.argv[1]
+REPORT_FORMAT = sys.argv[2]
+OUTPUT_FILE = sys.argv[3] if len(sys.argv) > 3 else ""
+STATE_DIR = os.path.join(ENGAGEMENT_DIR, ".cyberpi")
+SCOPE_FILE = os.path.join(STATE_DIR, "scope.json")
+SURFACE_FILE = os.path.join(STATE_DIR, "surface.json")
+JOURNAL_FILE = os.path.join(STATE_DIR, "journal.jsonl")
+FINDINGS_DIR = os.path.join(STATE_DIR, "findings")
+
+SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"]
+
+
+def strip_json_comments(text):
+    out = []
+    in_string = False
+    in_line = False
+    in_block = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        nxt = text[index + 1] if index + 1 < len(text) else ""
+        if in_line:
+            if char == "\n":
+                in_line = False
+                out.append(char)
+            index += 1
+            continue
+        if in_block:
+            if char == "*" and nxt == "/":
+                in_block = False
+                index += 2
+                continue
+            index += 1
+            continue
+        if in_string:
+            if char == "\\":
+                out.append(char)
+                index += 1
+                if index < len(text):
+                    out.append(text[index])
+                    index += 1
+                continue
+            if char == '"':
+                in_string = False
+            out.append(char)
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char == "/" and nxt == "/":
+            in_line = True
+            index += 2
+            continue
+        if char == "/" and nxt == "*":
+            in_block = True
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def read_json(path):
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.loads(strip_json_comments(handle.read()))
+    except (OSError, ValueError):
+        return None
+
+
+def read_jsonl(path):
+    entries = []
+    if not os.path.isfile(path):
+        return entries
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(parsed, dict):
+                    entries.append(parsed)
+    except OSError:
+        return entries
+    return entries
+
+
+def parse_scalar(raw):
+    value = raw.strip()
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        return value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return value
+
+
+def parse_list(raw):
+    value = raw.strip()
+    if not (value.startswith("[") and value.endswith("]")):
+        return []
+    inner = value[1:-1].strip()
+    if not inner:
+        return []
+    return [parse_scalar(item) for item in inner.split(",") if item.strip()]
+
+
+def parse_finding(raw):
+    match = re.match(r"^---\r?\n(.*?)\r?\n---\r?\n(.*)$", raw, re.DOTALL)
+    if not match:
+        return None
+    fields = {}
+    for line in match.group(1).split("\n"):
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip()] = value.strip()
+    sections = {}
+    current = ""
+    for line in match.group(2).split("\n"):
+        header = re.match(r"^##\s+(.+)$", line)
+        if header:
+            current = header.group(1).strip().lower()
+            sections[current] = ""
+            continue
+        if current:
+            sections[current] += line + "\n"
+
+    def clean(value):
+        lines = [item.strip() for item in value.split("\n")]
+        return "\n".join(item for item in lines if item and not item.startswith("```"))
+
+    severity = fields.get("severity", "info").lower()
+    if severity not in SEVERITY_ORDER:
+        severity = "info"
+    return {
+        "id": fields.get("id", "FINDING-UNKNOWN"),
+        "title": parse_scalar(fields.get("title", "Untitled finding")),
+        "severity": severity,
+        "cvss": fields.get("cvss", ""),
+        "cve": fields.get("cve", ""),
+        "cwe": fields.get("cwe", ""),
+        "target": parse_scalar(fields.get("target", "unknown")),
+        "status": fields.get("status", "open"),
+        "tags": parse_list(fields.get("tags", "")),
+        "references": parse_list(fields.get("references", "")),
+        "createdAt": fields.get("createdAt", ""),
+        "updatedAt": fields.get("updatedAt", ""),
+        "description": clean(sections.get("description", "")),
+        "impact": clean(sections.get("impact", "")),
+        "reproduction": clean(sections.get("reproduction", "")),
+        "evidence": [item.strip() for item in sections.get("evidence", "").split("\n") if item.strip().startswith("-")],
+        "raw": match.group(2).strip(),
+    }
+
+
+def load_findings():
+    findings = []
+    if not os.path.isdir(FINDINGS_DIR):
+        return findings
+    for path in sorted(glob.glob(os.path.join(FINDINGS_DIR, "*.md"))):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                parsed = parse_finding(handle.read())
+        except OSError:
+            continue
+        if parsed:
+            findings.append(parsed)
+    findings.sort(key=lambda item: (SEVERITY_ORDER.index(item["severity"]), item["id"]))
+    return findings
+
+
+def severity_counts(findings):
+    counts = {}
+    for finding in findings:
+        counts[finding["severity"]] = counts.get(finding["severity"], 0) + 1
+    return counts
+
+
+def escape_markdown_cell(value):
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def render_markdown(data):
+    scope = data["scope"]
+    findings = data["findings"]
+    surface = data["surface"]
+    journal = data["journal"]
+    counts = data["severityCounts"]
+    out = []
+    name = scope.get("engagement") or os.path.basename(ENGAGEMENT_DIR.rstrip("/")) or "engagement"
+    out.append("# Engagement report: %s" % name)
+    out.append("")
+    out.append("_Generated by CyberPi on %s from %s_" % (data["generatedAt"], ENGAGEMENT_DIR))
+    out.append("")
+    out.append("| Field | Value |")
+    out.append("|---|---|")
+    out.append("| Engagement | %s |" % escape_markdown_cell(name))
+    if scope.get("client"):
+        out.append("| Client | %s |" % escape_markdown_cell(scope.get("client")))
+    authorization = scope.get("authorization") or {}
+    if authorization.get("statement"):
+        out.append("| Authorization | %s |" % escape_markdown_cell(authorization.get("statement")))
+    if authorization.get("authorizedBy"):
+        out.append("| Authorized by | %s |" % escape_markdown_cell(authorization.get("authorizedBy")))
+    window = [str(authorization.get("start", "")), str(authorization.get("end", ""))]
+    window = [item for item in window if item]
+    if window:
+        out.append("| Window | %s |" % escape_markdown_cell(" to ".join(window)))
+    if scope.get("notes"):
+        out.append("| Notes | %s |" % escape_markdown_cell(scope.get("notes")))
+    out.append("")
+
+    out.append("## Executive summary")
+    out.append("")
+    if findings:
+        breakdown = ", ".join(
+            "%d %s" % (counts[severity], severity) for severity in SEVERITY_ORDER if counts.get(severity)
+        )
+        out.append("- Findings: %d (%s)" % (len(findings), breakdown))
+    else:
+        out.append("- Findings: none were recorded.")
+    out.append(
+        "- Attack surface: %d host(s), %d service(s), %d endpoint(s)"
+        % (len(surface.get("hosts", [])), len(surface.get("services", [])), len(surface.get("endpoints", [])))
+    )
+    out.append("- Actions journaled: %d" % len(journal))
+    out.append("")
+
+    out.append("## Authorized scope")
+    out.append("")
+    rules = scope.get("rules") or []
+    if rules:
+        out.append("| Rule | Target | Ports | Protocols | Techniques | Notes |")
+        out.append("|---|---|---|---|---|---|")
+        for rule in rules:
+            out.append(
+                "| %s | %s | %s | %s | %s | %s |"
+                % (
+                    escape_markdown_cell(rule.get("id", "")),
+                    escape_markdown_cell(rule.get("target", "")),
+                    escape_markdown_cell(", ".join(str(port) for port in rule.get("ports", []) or [])),
+                    escape_markdown_cell(", ".join(str(item) for item in rule.get("protocols", []) or [])),
+                    escape_markdown_cell(", ".join(str(item) for item in rule.get("techniques", []) or [])),
+                    escape_markdown_cell(rule.get("notes", "")),
+                )
+            )
+    else:
+        out.append("No target was authorized, so only self-tests against the local machine were possible.")
+    techniques = scope.get("techniques") or []
+    out.append("")
+    out.append("Techniques allowed: %s" % (", ".join(str(item) for item in techniques) if techniques else "all"))
+    out.append("")
+
+    hosts = surface.get("hosts", [])
+    services = surface.get("services", [])
+    endpoints = surface.get("endpoints", [])
+    out.append("## Attack surface")
+    out.append("")
+    out.append("### Hosts")
+    out.append("")
+    if hosts:
+        out.append("| Host | Addresses | Source | First seen |")
+        out.append("|---|---|---|---|")
+        for host in hosts:
+            out.append(
+                "| %s | %s | %s | %s |"
+                % (
+                    escape_markdown_cell(host.get("host", "")),
+                    escape_markdown_cell(", ".join(str(item) for item in host.get("addresses", []) or [])),
+                    escape_markdown_cell(host.get("source", "")),
+                    escape_markdown_cell(host.get("firstSeen", "")),
+                )
+            )
+    else:
+        out.append("No host was discovered.")
+    out.append("")
+    out.append("### Services")
+    out.append("")
+    if services:
+        out.append("| Host | Port | Protocol | Service | Version | Source |")
+        out.append("|---|---|---|---|---|---|")
+        for service in services:
+            out.append(
+                "| %s | %s | %s | %s | %s | %s |"
+                % (
+                    escape_markdown_cell(service.get("host", "")),
+                    escape_markdown_cell(service.get("port", "")),
+                    escape_markdown_cell(service.get("protocol", "")),
+                    escape_markdown_cell(service.get("service", "")),
+                    escape_markdown_cell(service.get("version", "")),
+                    escape_markdown_cell(service.get("source", "")),
+                )
+            )
+    else:
+        out.append("No service was discovered.")
+    out.append("")
+    out.append("### Endpoints")
+    out.append("")
+    if endpoints:
+        out.append("| URL | Status | Title | Technology |")
+        out.append("|---|---|---|---|")
+        for endpoint in endpoints:
+            out.append(
+                "| %s | %s | %s | %s |"
+                % (
+                    escape_markdown_cell(endpoint.get("url", "")),
+                    escape_markdown_cell(endpoint.get("status", "")),
+                    escape_markdown_cell(endpoint.get("title", "")),
+                    escape_markdown_cell(", ".join(str(item) for item in endpoint.get("technology", []) or [])),
+                )
+            )
+    else:
+        out.append("No endpoint was discovered.")
+    out.append("")
+
+    out.append("## Findings")
+    out.append("")
+    if not findings:
+        out.append("No finding was recorded for this engagement.")
+        out.append("")
+    for finding in findings:
+        out.append("### %s %s" % (finding["id"], finding["title"]))
+        out.append("")
+        out.append("- Severity: %s" % finding["severity"])
+        if finding["cvss"]:
+            out.append("- CVSS: %s" % finding["cvss"])
+        if finding["cve"]:
+            out.append("- CVE: %s" % finding["cve"])
+        if finding["cwe"]:
+            out.append("- CWE: %s" % finding["cwe"])
+        out.append("- Target: %s" % finding["target"])
+        out.append("- Status: %s" % finding["status"])
+        if finding["references"]:
+            out.append("- References: %s" % ", ".join(finding["references"]))
+        out.append("")
+        if finding["description"]:
+            out.append("#### Description")
+            out.append("")
+            out.append(finding["description"])
+            out.append("")
+        if finding["impact"]:
+            out.append("#### Impact")
+            out.append("")
+            out.append(finding["impact"])
+            out.append("")
+        if finding["reproduction"]:
+            out.append("#### Reproduction")
+            out.append("")
+            out.append("```bash")
+            out.append(finding["reproduction"])
+            out.append("```")
+            out.append("")
+        if finding["evidence"]:
+            out.append("#### Evidence")
+            out.append("")
+            for item in finding["evidence"]:
+                out.append("- %s" % item.lstrip("- ").strip())
+            out.append("")
+
+    out.append("## Activity log")
+    out.append("")
+    if not journal:
+        out.append("No action was journaled for this engagement.")
+        out.append("")
+    else:
+        by_tool = {}
+        by_severity = {}
+        for entry in journal:
+            tool = entry.get("tool", "unknown")
+            by_tool[tool] = by_tool.get(tool, 0) + 1
+            severity = entry.get("severity", "info")
+            by_severity[severity] = by_severity.get(severity, 0) + 1
+        out.append("- Total actions: %d" % len(journal))
+        out.append("- By tool: %s" % ", ".join("%s (%d)" % (tool, by_tool[tool]) for tool in sorted(by_tool)))
+        out.append("- By severity: %s" % ", ".join("%s (%d)" % (key, by_severity[key]) for key in sorted(by_severity)))
+        out.append("")
+        out.append("| Time | Tool | Action | Target | Result | Exit |")
+        out.append("|---|---|---|---|---|---|")
+        for entry in journal:
+            out.append(
+                "| %s | %s | %s | %s | %s | %s |"
+                % (
+                    escape_markdown_cell(entry.get("ts", "")),
+                    escape_markdown_cell(entry.get("tool", "")),
+                    escape_markdown_cell(entry.get("action", "")),
+                    escape_markdown_cell(entry.get("target", "")),
+                    escape_markdown_cell(entry.get("summary", "")),
+                    escape_markdown_cell("" if entry.get("exitCode") is None else entry.get("exitCode")),
+                )
+            )
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def inline_markdown(text):
+    escaped = html.escape(text)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", escaped)
+    escaped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', escaped)
+    return escaped
+
+
+def markdown_to_html(text):
+    if not text:
+        return ""
+    out = []
+    in_code = False
+    in_list = False
+    paragraph = []
+
+    def flush_paragraph():
+        if paragraph:
+            out.append("<p>%s</p>" % inline_markdown(" ".join(paragraph).strip()))
+            paragraph.clear()
+
+    def close_list():
+        nonlocal in_list
+        if in_list:
+            out.append("</ul>")
+            in_list = False
+
+    for line in text.split("\n"):
+        if line.strip().startswith("```"):
+            if in_code:
+                out.append("</code></pre>")
+                in_code = False
+            else:
+                flush_paragraph()
+                close_list()
+                out.append("<pre><code>")
+                in_code = True
+            continue
+        if in_code:
+            out.append(html.escape(line))
+            continue
+        stripped = line.strip()
+        if not stripped:
+            flush_paragraph()
+            close_list()
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading:
+            flush_paragraph()
+            close_list()
+            level = len(heading.group(1))
+            out.append("<h%d>%s</h%d>" % (level, inline_markdown(heading.group(2)), level))
+            continue
+        bullet = re.match(r"^[-*]\s+(.*)$", stripped)
+        if bullet:
+            flush_paragraph()
+            if not in_list:
+                out.append("<ul>")
+                in_list = True
+            out.append("<li>%s</li>" % inline_markdown(bullet.group(1)))
+            continue
+        close_list()
+        paragraph.append(stripped)
+    flush_paragraph()
+    close_list()
+    if in_code:
+        out.append("</code></pre>")
+    return "\n".join(out)
+
+
+HTML_STYLE = """
+:root { color-scheme: dark; }
+body { background: #05080c; color: #cfe3ef; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+       line-height: 1.55; margin: 0; padding: 2.5rem 1.5rem; }
+main { max-width: 68rem; margin: 0 auto; }
+h1 { color: #22d3ee; border-bottom: 1px solid #134e5a; padding-bottom: .5rem; }
+h2 { color: #67e8f9; margin-top: 2.5rem; border-bottom: 1px solid #0f2b33; padding-bottom: .3rem; }
+h3 { color: #a5f3fc; }
+h4 { color: #7dd3fc; text-transform: uppercase; letter-spacing: .08em; font-size: .8rem; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .9rem; }
+th, td { border: 1px solid #134e5a; padding: .4rem .6rem; text-align: left; vertical-align: top; }
+th { background: #08222b; color: #67e8f9; }
+tr:nth-child(even) td { background: #07131a; }
+code { background: #08222b; padding: .1rem .3rem; border-radius: 3px; color: #a5f3fc; }
+pre { background: #07131a; border: 1px solid #134e5a; padding: .8rem; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+.meta { color: #7d95a3; }
+.severity { display: inline-block; padding: .1rem .5rem; border-radius: 3px; font-size: .75rem;
+            text-transform: uppercase; letter-spacing: .08em; }
+.severity-critical { background: #7f1d1d; color: #fecaca; }
+.severity-high { background: #7c2d12; color: #fed7aa; }
+.severity-medium { background: #713f12; color: #fde68a; }
+.severity-low { background: #1e3a8a; color: #bfdbfe; }
+.severity-info { background: #164e63; color: #a5f3fc; }
+ul { padding-left: 1.2rem; }
+a { color: #22d3ee; }
+"""
+
+
+def render_html(data):
+    scope = data["scope"]
+    findings = data["findings"]
+    surface = data["surface"]
+    journal = data["journal"]
+    counts = data["severityCounts"]
+    name = scope.get("engagement") or os.path.basename(ENGAGEMENT_DIR.rstrip("/")) or "engagement"
+    out = []
+    out.append("<!DOCTYPE html>")
+    out.append('<html lang="en">')
+    out.append("<head>")
+    out.append('<meta charset="utf-8">')
+    out.append('<meta name="viewport" content="width=device-width, initial-scale=1">')
+    out.append("<title>CyberPi report - %s</title>" % html.escape(name))
+    out.append("<style>%s</style>" % HTML_STYLE)
+    out.append("</head>")
+    out.append("<body>")
+    out.append("<main>")
+    out.append("<h1>Engagement report: %s</h1>" % html.escape(name))
+    out.append('<p class="meta">Generated by CyberPi on %s from %s</p>' % (html.escape(data["generatedAt"]), html.escape(ENGAGEMENT_DIR)))
+    out.append("<h2>Executive summary</h2>")
+    out.append("<ul>")
+    if findings:
+        breakdown = ", ".join("%d %s" % (counts[severity], severity) for severity in SEVERITY_ORDER if counts.get(severity))
+        out.append("<li>Findings: %d (%s)</li>" % (len(findings), html.escape(breakdown)))
+    else:
+        out.append("<li>No finding was recorded.</li>")
+    out.append(
+        "<li>Attack surface: %d host(s), %d service(s), %d endpoint(s)</li>"
+        % (len(surface.get("hosts", [])), len(surface.get("services", [])), len(surface.get("endpoints", [])))
+    )
+    out.append("<li>Actions journaled: %d</li>" % len(journal))
+    out.append("</ul>")
+
+    out.append("<h2>Authorization</h2>")
+    out.append("<table>")
+    out.append("<tr><th>Field</th><th>Value</th></tr>")
+    authorization = scope.get("authorization") or {}
+    rows = [("Engagement", name), ("Client", scope.get("client", "")),
+            ("Statement", authorization.get("statement", "")), ("Authorized by", authorization.get("authorizedBy", "")),
+            ("Start", authorization.get("start", "")), ("End", authorization.get("end", "")),
+            ("Notes", scope.get("notes", ""))]
+    for label, value in rows:
+        out.append("<tr><td>%s</td><td>%s</td></tr>" % (html.escape(str(label)), html.escape(str(value or ""))))
+    out.append("</table>")
+
+    out.append("<h2>Authorized scope</h2>")
+    rules = scope.get("rules") or []
+    if rules:
+        out.append("<table>")
+        out.append("<tr><th>Rule</th><th>Target</th><th>Ports</th><th>Protocols</th><th>Techniques</th><th>Notes</th></tr>")
+        for rule in rules:
+            cells = [
+                rule.get("id", ""),
+                rule.get("target", ""),
+                ", ".join(str(port) for port in rule.get("ports", []) or []),
+                ", ".join(str(item) for item in rule.get("protocols", []) or []),
+                ", ".join(str(item) for item in rule.get("techniques", []) or []),
+                rule.get("notes", ""),
+            ]
+            out.append("<tr>%s</tr>" % "".join("<td>%s</td>" % html.escape(str(cell)) for cell in cells))
+        out.append("</table>")
+    else:
+        out.append("<p>No target was authorized, so only self-tests against the local machine were possible.</p>")
+    techniques = scope.get("techniques") or []
+    out.append("<p class=\"meta\">Techniques allowed: %s</p>" % html.escape(", ".join(str(item) for item in techniques) if techniques else "all"))
+
+    out.append("<h2>Attack surface</h2>")
+    out.append("<h3>Hosts</h3>")
+    hosts = surface.get("hosts", [])
+    if hosts:
+        out.append("<table>")
+        out.append("<tr><th>Host</th><th>Addresses</th><th>Source</th><th>First seen</th></tr>")
+        for host in hosts:
+            cells = [host.get("host", ""), ", ".join(str(item) for item in host.get("addresses", []) or []),
+                     host.get("source", ""), host.get("firstSeen", "")]
+            out.append("<tr>%s</tr>" % "".join("<td>%s</td>" % html.escape(str(cell)) for cell in cells))
+        out.append("</table>")
+    else:
+        out.append("<p>No host was discovered.</p>")
+    out.append("<h3>Services</h3>")
+    services = surface.get("services", [])
+    if services:
+        out.append("<table>")
+        out.append("<tr><th>Host</th><th>Port</th><th>Protocol</th><th>Service</th><th>Version</th><th>Source</th></tr>")
+        for service in services:
+            cells = [service.get("host", ""), service.get("port", ""), service.get("protocol", ""),
+                     service.get("service", ""), service.get("version", ""), service.get("source", "")]
+            out.append("<tr>%s</tr>" % "".join("<td>%s</td>" % html.escape(str(cell)) for cell in cells))
+        out.append("</table>")
+    else:
+        out.append("<p>No service was discovered.</p>")
+    out.append("<h3>Endpoints</h3>")
+    endpoints = surface.get("endpoints", [])
+    if endpoints:
+        out.append("<table>")
+        out.append("<tr><th>URL</th><th>Status</th><th>Title</th><th>Technology</th></tr>")
+        for endpoint in endpoints:
+            cells = [endpoint.get("url", ""), endpoint.get("status", ""), endpoint.get("title", ""),
+                     ", ".join(str(item) for item in endpoint.get("technology", []) or [])]
+            out.append("<tr>%s</tr>" % "".join("<td>%s</td>" % html.escape(str(cell)) for cell in cells))
+        out.append("</table>")
+    else:
+        out.append("<p>No endpoint was discovered.</p>")
+
+    out.append("<h2>Findings</h2>")
+    if not findings:
+        out.append("<p>No finding was recorded for this engagement.</p>")
+    for finding in findings:
+        out.append("<h3>%s %s <span class=\"severity severity-%s\">%s</span></h3>" % (
+            html.escape(finding["id"]), html.escape(finding["title"]), html.escape(finding["severity"]),
+            html.escape(finding["severity"])))
+        out.append("<table>")
+        out.append("<tr><th>Severity</th><th>CVSS</th><th>CVE</th><th>CWE</th><th>Target</th><th>Status</th></tr>")
+        out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            html.escape(finding["severity"]), html.escape(str(finding["cvss"])), html.escape(str(finding["cve"])),
+            html.escape(str(finding["cwe"])), html.escape(str(finding["target"])), html.escape(str(finding["status"]))))
+        out.append("</table>")
+        if finding["description"]:
+            out.append("<h4>Description</h4>")
+            out.append(markdown_to_html(finding["description"]))
+        if finding["impact"]:
+            out.append("<h4>Impact</h4>")
+            out.append(markdown_to_html(finding["impact"]))
+        if finding["reproduction"]:
+            out.append("<h4>Reproduction</h4>")
+            out.append("<pre><code>%s</code></pre>" % html.escape(finding["reproduction"]))
+        if finding["evidence"]:
+            out.append("<h4>Evidence</h4>")
+            out.append("<ul>")
+            for item in finding["evidence"]:
+                out.append("<li>%s</li>" % inline_markdown(item.lstrip("- ").strip()))
+            out.append("</ul>")
+        if finding["references"]:
+            out.append("<h4>References</h4>")
+            out.append("<ul>")
+            for reference in finding["references"]:
+                out.append("<li>%s</li>" % inline_markdown(reference))
+            out.append("</ul>")
+
+    out.append("<h2>Activity log</h2>")
+    if not journal:
+        out.append("<p>No action was journaled for this engagement.</p>")
+    else:
+        by_tool = {}
+        by_severity = {}
+        for entry in journal:
+            tool = entry.get("tool", "unknown")
+            by_tool[tool] = by_tool.get(tool, 0) + 1
+            severity = entry.get("severity", "info")
+            by_severity[severity] = by_severity.get(severity, 0) + 1
+        out.append("<ul>")
+        out.append("<li>Total actions: %d</li>" % len(journal))
+        out.append("<li>By tool: %s</li>" % html.escape(", ".join("%s (%d)" % (tool, by_tool[tool]) for tool in sorted(by_tool))))
+        out.append("<li>By severity: %s</li>" % html.escape(", ".join("%s (%d)" % (key, by_severity[key]) for key in sorted(by_severity))))
+        out.append("</ul>")
+        out.append("<table>")
+        out.append("<tr><th>Time</th><th>Tool</th><th>Action</th><th>Target</th><th>Result</th><th>Exit</th></tr>")
+        for entry in journal:
+            cells = [entry.get("ts", ""), entry.get("tool", ""), entry.get("action", ""),
+                     entry.get("target", ""), entry.get("summary", ""),
+                     "" if entry.get("exitCode") is None else entry.get("exitCode")]
+            out.append("<tr>%s</tr>" % "".join("<td>%s</td>" % html.escape(str(cell)) for cell in cells))
+        out.append("</table>")
+    out.append("</main>")
+    out.append("</body>")
+    out.append("</html>")
+    return "\n".join(out) + "\n"
+
+
+scope = read_json(SCOPE_FILE) or {}
+surface = read_json(SURFACE_FILE) or {}
+if not isinstance(surface, dict):
+    surface = {}
+surface.setdefault("hosts", [])
+surface.setdefault("services", [])
+surface.setdefault("endpoints", [])
+findings = load_findings()
+journal = read_jsonl(JOURNAL_FILE)
+
+data = {
+    "generatedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "scope": scope,
+    "surface": surface,
+    "findings": findings,
+    "journal": journal,
+    "severityCounts": severity_counts(findings),
+}
+
+if REPORT_FORMAT == "html":
+    document = render_html(data)
+else:
+    document = render_markdown(data)
+
+if OUTPUT_FILE:
+    target = OUTPUT_FILE
+    if not os.path.isabs(target):
+        target = os.path.join(ENGAGEMENT_DIR, ".cyberpi", "reports", target)
+    parent = os.path.dirname(target)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as handle:
+        handle.write(document)
+    print(target)
+else:
+    sys.stdout.write(document)
+PYTHON

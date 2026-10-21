@@ -1,0 +1,14 @@
+# CyberPi targets Linux: keep every file LF terminated in the working tree,
+# whatever the operating system does the clone on.
+* text=auto eol=lf
+
+# Shell scripts must stay executable and LF terminated.
+*.sh text eol=lf
+bin/cyberpi text eol=lf
+bin/cyberpi-doctor text eol=lf
+bin/cyberpi-report text eol=lf
+
+# Binary-ish assets that must never be touched.
+*.pcap binary
+*.pcapng binary
+*.png binary
